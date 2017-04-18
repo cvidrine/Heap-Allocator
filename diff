@@ -1,0 +1,542 @@
+diff -r 713620527b9b Makefile
+--- a/Makefile	Thu Jun 02 22:56:00 2016 -0700
++++ b/Makefile	Fri Jun 03 17:41:32 2016 -0700
+@@ -14,7 +14,7 @@
+ # (e.g. different levels and enabling/disabling specific optimizations)
+ # When you are ready to submit, be sure these flags are configured to
+ # show your allocator in its best light!
+-ALLOCATOR_EXTRA_CFLAGS = -O2
++ALLOCATOR_EXTRA_CFLAGS = -O0
+ 
+ # The CFLAGS variable sets the flags for the compiler.  CS107 adds these flags:
+ #  -g          compile with debug information
+diff -r 713620527b9b allocator.c
+--- a/allocator.c	Thu Jun 02 22:56:00 2016 -0700
++++ b/allocator.c	Fri Jun 03 17:41:32 2016 -0700
+@@ -39,13 +39,12 @@
+ #define NUM_BUCKETS 52
+ #define EXPONENTIAL_INDEX_START 30 //start of exponential buckets (sz 512)
+ #define EXPONENTIAL_INDEX_CONSTANT 23 //9 is the smallest exponential bucket, and 30 is largest 
+-#define BUCKET_SKIP 5
+-#define MIN_FRACTURE_SIZE 40
+-#define REALLOC_BUFFER 1.2
++#define REALLOC_BUFFER 3
+ #define REALLOC_SPLIT_MIN 80 //smallest size we coalesce with the next block for 
+ #define INITIAL_PAGES 15
+-#define MIN_REABSORB_SIZE 4096
+-#define MAX_COALESCE_SIZE 4080
++#define MIN_REABSORB_SIZE 4080
++#define MIN_COALESCE_SIZE 0 
++#define MIN_SPLIT_SIZE 24 
+ 
+ 
+ /* 64% throughput, 50% utilization with no coalescing
+@@ -55,17 +54,23 @@
+ #define REALLOC_SPLIT_MIN 96 //smallest size we coalesce with the next block for 
+ */
+ 
++typedef struct Memblock Memblock;
+ 
+-typedef struct{
+-    unsigned int header;
+-    struct Memblock* next; //pointer to the next member in the linked list 
+-    struct Memblock* prev;
++typedef struct {
++    unsigned int prevsz;
++    unsigned int size;
++} Header;
++
++typedef struct Memblock {
++    Header header;
++    Memblock* next; //pointer to the next member in the linked list 
++    Memblock* prev;
+ } Memblock;
+ 
+ static Memblock* wilderness;
+ static void* memblock_array[NUM_BUCKETS];
+ static int largest_block_index;
+-
++static void* heap_start;
+ 
+ typedef bool (*iteration_cmp_fn)(Memblock* b, unsigned int adj_sz);
+ /*---------------------------------------------------------------*/
+@@ -94,63 +99,42 @@
+    return (size | alloc_status); 
+ }
+ 
+-
+-//returns a word as unsigned int at address of ptr
+-static inline unsigned int get_word(void* ptr){
+-   return *(unsigned int*) ptr; 
+-}
+ static inline void put_word(void* ptr, unsigned int value){
+     *(unsigned int*)ptr = value;
+ }
+ 
++static inline unsigned int get_prev_size(void* b) {
++    return (((Memblock*)b)->header.prevsz & ~0x7);
++}
+ 
+ //get the fields stored within Memblock header
+ static inline unsigned int get_size(void* b){
+-    return (((Memblock*)b)->header & ~0x7);
++    return (((Memblock*)b)->header.size & ~0x7);
+ }
+ static inline bool is_allocd(void* b){
+-    return (((Memblock*)b)->header & 0x1);
+-}
+-
+-
+-//returns the footer of the previous block
+-static inline unsigned int get_prev_footer(Memblock* b){
+-    return get_word((char*)b - WSIZE);
++    return (((Memblock*)b)->header.size & 0x1);
+ }
+ 
+ static inline bool in_bounds(void* location){ //TODO: write to be less specific
+-    return (location >= heap_segment_start() && (char*)location <= (char*)heap_segment_start() + heap_segment_size());
++    return (location >= heap_start && (char*)location <= (char*)heap_start + heap_segment_size());
+ }
+ 
+ //if prev block is allocd or is the first block, return NULL 
+ static inline Memblock* prev_contiguous(void* b){
+-    unsigned int prev_footer = ((*(unsigned int*)((char*)b - WSIZE)) & ~0x7);  
+-    Memblock* prev_block = (Memblock*)((char*)b - prev_footer); 
+-    if(is_allocd(prev_block) || (void *)prev_block <= heap_segment_start()) return NULL;
++    Memblock* prev_block = (Memblock*)((char*)b - get_prev_size(b)); 
++    if((void *)prev_block <= heap_start) return NULL;
+     return prev_block;
+ }
+ 
+ //if next block is allocd, returns NULL 
+ static inline Memblock* next_contiguous(void* b){
+-    Memblock *next =(Memblock *)((char *)b+get_size((Memblock*)b));
+-    if(is_allocd(next)) return NULL;
++    Memblock *next =(Memblock *)((char *)b + get_size(b));
+     return next;
+ }
+ 
+-//get and set the footer
+-static inline unsigned int* get_footer(Memblock* bl){
+-  return (unsigned int*)((char *)bl + get_size(bl) - WSIZE);
+-}
+-
+-static inline void set_footer(Memblock* b, unsigned int value){
+-    unsigned int *footer = get_footer(b);
+-    *footer = value;
+-}
+-
+-
+ //returns a pointer to raw memory in an allocd block (after the unsigned int header) 
+ static inline void* get_payload(void* allocd_block){
+-    return (void*)((char*)allocd_block + sizeof(unsigned int)); 
++    return (void*)((char*)allocd_block + sizeof(Header)); 
+ }
+ /*---------------------------------------------------------------*/
+ 
+@@ -159,16 +143,9 @@
+ 
+ /*functions for interfacing with the array*/
+ /*---------------------------------------------------------------*/
+-//returns a properly padded size
+-static inline unsigned int rounded_size(unsigned int sz){
+-    unsigned int divisible = (sz & 0xfffffff8);
+-    if(sz == divisible) return sz; //already a multiple of eight
+-    else return divisible + 8; //divisible + 16 gives next multiple "up" of 8 
+-}
+-
+ //based on the size, do the necessary calculations to map to bucket
+ static inline int get_index(unsigned int sz){
+-    if(sz>256) assert(__builtin_ctz(sz) + EXPONENTIAL_INDEX_CONSTANT < NUM_BUCKETS);  
++    if(sz>256) assert(__builtin_clz(sz) + EXPONENTIAL_INDEX_CONSTANT < NUM_BUCKETS);  
+     if(sz < 256) return ((sz-24)/8);
+     else return (24 - (__builtin_clz(sz) + 1)) + EXPONENTIAL_INDEX_CONSTANT; //equal to 23, just to help with array
+ }
+@@ -176,7 +153,7 @@
+ static void request_pages(unsigned int adjusted_sz){
+     int num_pages = (adjusted_sz/PAGE_SIZE) + 1;
+     num_pages+=3; //TODO:change this 
+-    wilderness->header += num_pages * PAGE_SIZE;
++    wilderness->header.size += num_pages * PAGE_SIZE;
+     extend_heap_segment(num_pages); //if its not big enough
+ }
+ 
+@@ -184,7 +161,7 @@
+ static void increment_wilderness(unsigned int adjusted_sz){
+     unsigned int wilderness_size = get_size(wilderness);
+     wilderness = (Memblock*)((char *)wilderness + adjusted_sz);
+-    wilderness->header = wilderness_size - adjusted_sz; 
++    wilderness->header.size = wilderness_size - adjusted_sz; 
+ }
+ 
+ /*---------------------------------------------------------------*/
+@@ -198,15 +175,15 @@
+ /*---------------------------------------------------------------*/
+ //sets the header and footer of an allocated block
+ static Memblock * create_allocd_block(Memblock* b,unsigned int adjusted_sz){
+-    b->header = pack(adjusted_sz,true); 
+-    set_footer(b,b->header); 
++    b->header.size = pack(adjusted_sz,true); 
++    next_contiguous(b)->header.prevsz = b->header.size;
+     return b;
+ }
+ 
+ //sets header, footer and freed status... next field set to null
+ static Memblock * create_freed_block(Memblock* b, unsigned int adjusted_sz){
+-    b->header = pack(adjusted_sz,false);
+-    set_footer(b,b->header);
++    b->header.size = pack(adjusted_sz,false);
++    next_contiguous(b)->header.prevsz = b->header.size;
+     b->next = NULL;
+     b->prev = NULL;
+     return b;
+@@ -218,61 +195,49 @@
+ 
+ /*array iteration*/
+ /*---------------------------------------------------------------*/
+-static void remove_element(Memblock *currblock, int index){
+-
+-    Memblock* prev_block = (Memblock*)currblock->prev;
+-    Memblock* next_block = (Memblock*)currblock->next;
+-    if(prev_block == NULL && next_block == NULL){
+-        memblock_array[index] = NULL;
+-        return;
+-    }
+-    if(prev_block == NULL) { //it's the first member of the array      
+-        if(next_block != NULL) next_block->prev = NULL;  
+-        memblock_array[index] = next_block; 
+-    } else { //prev_block exists
+-        if(next_block != NULL) next_block->prev = (struct Memblock*)prev_block;  
+-        prev_block->next = (struct Memblock*)next_block;
+-    }
++static void remove_element(void* curr, int index){
++    Memblock* currblock = (Memblock *)curr;
++    Memblock* prev_block = currblock->prev;
++    Memblock* next_block = currblock->next;
++    if (prev_block != NULL)
++        prev_block->next = next_block;
++    if (prev_block == NULL)
++        memblock_array[index] = next_block;
++    if (next_block != NULL)
++        next_block->prev = prev_block;
++    currblock->prev = NULL;
++    currblock->next = NULL;
+ }
+ 
+-//can be adjusted to trigger a "match" on fitting size, i.e. if we want to split blocks 
+-static inline bool perfect_match(Memblock* current, unsigned int target_size){
+-    return get_size(current) == target_size;
+-}
+-
+-static inline bool best_fit(Memblock* current, unsigned int target_size){
+-    return get_size(current) >= target_size + MIN_FRACTURE_SIZE; //remainder block buffer 
++//stores a new freed block in the array
++static void add_element(Memblock* new){
++    int index = get_index(get_size(new)); //get index
++    if(index > largest_block_index) largest_block_index = index;
++    Memblock* old_first = memblock_array[index];
++    new->next = NULL;
++    if(old_first != NULL){
++        old_first->prev = new; //point old first the new first  
++        new->next  = old_first;  //point new first to old first 
++    }
++    new->prev = NULL;
++    memblock_array[index] = new;
+ }
+ 
+ //iterates through the array, and removes a match, if found 
+-static Memblock* iterate_through_bucket(int arr_index, unsigned int adjustedSize,iteration_cmp_fn compare){ 
++static Memblock* iterate_through_bucket(int arr_index, unsigned int adjustedSize){ 
+     Memblock* curr = (Memblock*)memblock_array[arr_index]; 
+     if(curr == NULL) return NULL;
+-    while(true){ 
+-        if(compare(curr,adjustedSize)){
+-            remove_element(curr,arr_index);
++    while(true) { 
++        if(get_size(curr) >= adjustedSize) {
++            remove_element(curr, arr_index);
+             return curr;
+         }
+-        if(curr->next == NULL) break;    
+-        curr = (Memblock*)curr->next;  
++        if(curr->next == NULL) break;
++        curr = curr->next;
+     }
+     return NULL;
+ }
+ 
+-
+-//stores a new freed block in the array
+-static void array_put(Memblock* new){
+-    int index = get_index(get_size(new)); //get index
+-    if(index > largest_block_index) largest_block_index = index;
+-    Memblock* old_first = memblock_array[index];
+-    if(old_first != NULL){
+-        old_first->prev = (struct Memblock*)new; //point old first the new first  
+-        new->next  = (struct Memblock*)old_first;  //point new first to old first 
+-    }
+-    new->prev = NULL;
+-    memblock_array[index] = new;
+-}
+-
+ static void adjust_largest(){
+     for(int i=largest_block_index; i>=0; i--) {
+         if(memblock_array[i] != NULL) {
+@@ -282,88 +247,33 @@
+     }
+ }
+ 
+-static Memblock * split_block(Memblock *largeChunk, int index, unsigned int adjustedsz){//Block you wanna cut, index of that block, size you wanna steal.
+-    unsigned int original_size = get_size(largeChunk);
+-    Memblock* remainder = (Memblock*)((char *)largeChunk + adjustedsz);
+-    remainder = create_freed_block(remainder, original_size-adjustedsz); 
+-    array_put(remainder); 
+-    if(index == largest_block_index) adjust_largest();
+-    return largeChunk;
++static unsigned int split_block(Memblock *largeChunk, int index, unsigned int adjustedsz){//Block you wanna cut, index of that block, size you wanna steal.
++    unsigned int new_size;
++    unsigned int original_size = new_size = get_size(largeChunk);
++
++    if (original_size - adjustedsz >= MIN_SPLIT_SIZE) {
++        Memblock* remainder = (Memblock*)((char *)largeChunk + adjustedsz);
++        remainder = create_freed_block(remainder, original_size - adjustedsz); 
++        add_element(remainder); 
++        new_size = adjustedsz;
++    }
++
++    if (index == largest_block_index) adjust_largest();
++
++    return new_size;
+ }
+ 
+ static Memblock* find_closest_fit(int arr_index, unsigned int adjustedSize){ 
+-    if(arr_index + BUCKET_SKIP < 29) arr_index += BUCKET_SKIP; 
+-    if(arr_index > largest_block_index) return NULL;
+-    for(int i = arr_index; i <=largest_block_index; i++){ 
+-        Memblock* return_segment = iterate_through_bucket(i,adjustedSize,best_fit); 
++    if (arr_index > largest_block_index) return NULL;
++    for(int i = arr_index; i <= largest_block_index; i++){ 
++        Memblock* return_segment = iterate_through_bucket(i, adjustedSize); 
+         if(return_segment == NULL) continue;
+-        return_segment = split_block(return_segment, arr_index, adjustedSize);
+-        return create_allocd_block(return_segment, adjustedSize);
++        unsigned int new_size = split_block(return_segment, arr_index, adjustedSize);
++        return create_allocd_block(return_segment, new_size);
+     }
+     return NULL;
+ }
+ 
+-
+-static Memblock* combine_blocks(Memblock *first,Memblock* second){
+-    unsigned int first_size = get_size(first);
+-    unsigned int second_size = get_size(second);
+-    int first_index = get_index(first_size);
+-    int second_index = get_index(second_size);
+-    remove_element(first, first_index);
+-    remove_element(second, second_index);
+-    return create_freed_block(first, first_size+second_size);
+-}
+-
+-static void absorb_to_wilderness(Memblock* block){
+-    unsigned int wilderness_size = get_size(wilderness);
+-    unsigned int blockSize = get_size(block);
+-    wilderness = (Memblock*)((char *)wilderness - blockSize);
+-    wilderness->header = wilderness_size + blockSize; 
+-}
+-
+-static Memblock *coalesce_block(Memblock* middle_block){
+-    Memblock* next_block = next_contiguous(middle_block);
+-    //Memblock* prev_block = prev_contiguous(middle_block);
+-    if(next_block == wilderness){
+-        //try to coalesce with previous, then merge previous coalesce with wilderness 
+-        absorb_to_wilderness(middle_block);
+-        return NULL;
+-    }
+-    if(next_block != NULL){
+-        if(get_size(middle_block) + get_size(next_block) < MAX_COALESCE_SIZE){
+-            middle_block = combine_blocks(middle_block,next_block);
+-        }
+-    }
+-    
+-    return middle_block;
+-}
+-
+-static void coalesce_all(){
+-    for(int i = 0; i < NUM_BUCKETS; i++){
+-        Memblock* first = memblock_array[i]; 
+-        if(first == NULL) continue;
+-        while(first != NULL){
+-            Memblock* original_next = (Memblock*)first->next;
+-            first = coalesce_block(first); //frees both old ones and creates a new freed block 
+-            if(first == NULL) continue; //if wilderness, continue 
+-            array_put(first); //putting it into the array changes the pointer 
+-            first = original_next; //coalesce often makes no alterations, so it just keeps passing the same block back in  
+-            if(original_next == NULL) break;
+-        }  
+-        if(i == 1) assert(1==0);
+-    }
+-}
+-
+-
+-//finds a fitting match in the array
+-static Memblock *find_fit(unsigned int adjustedSize){
+-    int index = get_index(adjustedSize);
+-    Memblock* perfect_fit = NULL; 
+-    if(memblock_array[index] != NULL) perfect_fit = iterate_through_bucket(index, adjustedSize,perfect_match);
+-    if(perfect_fit != NULL) return perfect_fit; 
+-    //else coalesce_all();
+-    return find_closest_fit(index,adjustedSize);
+-}
+ /*---------------------------------------------------------------*/
+ 
+ 
+@@ -381,9 +291,8 @@
+  * without restarting program from scratch.
+ */
+ bool myinit(){
+-    init_heap_segment(0); // reset heap segment to empty, no pages allocated
+-    wilderness = (Memblock*)((uintptr_t)extend_heap_segment(INITIAL_PAGES) + 4); //TODO: not a permanent solution 
+-    wilderness->header = PAGE_SIZE;
++    heap_start = wilderness = init_heap_segment(INITIAL_PAGES); // reset heap segment to empty, no pages allocated
++    wilderness->header.size = PAGE_SIZE * INITIAL_PAGES;
+     for(int i = 0; i < NUM_BUCKETS; i ++) memblock_array[i] = NULL; //initialize array
+     largest_block_index = -1;
+     return true;
+@@ -391,23 +300,23 @@
+ 
+ static inline unsigned int adjust_size(size_t usersz){
+     unsigned int result = (unsigned int)usersz;
+-    if(result < 16) result=16;
+-    else result = rounded_size(usersz);
+-    return result+WSIZE*2; //only store the header and footer  d
++    if(result < 16) result = 16;
++
++    return roundup(result, ALIGNMENT) + sizeof(Header);
+ }
+ 
+ //malloc
+ void *mymalloc(size_t requestedsz){
+     if(requestedsz == 0) return NULL;
+     unsigned int adjusted_size = adjust_size(requestedsz);   
+-    Memblock *block = find_fit(adjusted_size);
++    Memblock *block = find_closest_fit(get_index(adjusted_size), adjusted_size);
+     if(block == NULL){
+         if(adjusted_size >= get_size(wilderness)) request_pages(adjusted_size);
+         block = wilderness;
++        block->header.size = adjusted_size;
+         increment_wilderness(adjusted_size); 
+     }
+-    block = create_allocd_block(block,adjusted_size); 
+-    //printf("%p\n",(void*)block);
++    block = create_allocd_block(block, get_size(block)); 
+     return get_payload(block);
+ }
+ 
+@@ -416,16 +325,45 @@
+ 
+ //backs up from the payload and returns the Memblock
+ static inline Memblock* block_from_payload(void* pointer){
+-   return (Memblock*)((char*)pointer - WSIZE); 
++   return (Memblock*)((char*)pointer - sizeof(Header)); 
++}
++
++static Memblock *coalesce_block(Memblock* middle_block){
++    Header *header = &middle_block->header;
++    Header *next = &next_contiguous(middle_block)->header;
++    Memblock *prev_block = prev_contiguous(middle_block);
++    Header *prev = NULL;
++    if (prev_block != NULL)
++        prev = &prev_block->header;
++
++    if (!is_allocd(next) && (Memblock *)next != wilderness && get_size(next) > MIN_COALESCE_SIZE) {
++        remove_element(next, get_index(get_size(next)));
++
++        header->size = pack(get_size(header) + get_size(next), false);    
++    }
++
++    if (prev != NULL && !is_allocd(prev) && get_size(prev) > MIN_COALESCE_SIZE) {
++        remove_element(prev, get_index(get_size(prev)));
++
++        prev->size = pack(get_size(header) + get_size(prev), false);
++        header = prev;
++    }
++
++    next_contiguous(header)->header.prevsz = header->size;
++    return (Memblock *)header;
+ }
+ 
+ void myfree(void *ptr){
+     Memblock* newly_freed = block_from_payload(ptr); 
+     if(!in_bounds(ptr))return;
+-    newly_freed = create_freed_block(newly_freed,get_size(newly_freed));
++    newly_freed = create_freed_block(newly_freed, get_size(newly_freed));
+     newly_freed = coalesce_block(newly_freed);
+-    if(newly_freed == NULL) return;
+-    array_put(newly_freed);
++    if (next_contiguous(newly_freed) == wilderness) {
++        newly_freed->header.size = pack(get_size(newly_freed) + get_size(wilderness), false); 
++        wilderness = newly_freed;
++        return;
++    }
++    add_element(newly_freed);
+ }
+ 
+ 
+@@ -437,42 +375,26 @@
+ void *myrealloc(void *oldptr, size_t newsz){
+     if(newsz <= 0) return NULL;
+     if(oldptr == NULL) return mymalloc(newsz);
++
+     unsigned int adjustedsz = adjust_size(newsz);//returns padded block
+-    Memblock *oldblock = block_from_payload(oldptr);
+-    unsigned int old_size = get_size(oldblock);
+-    unsigned int original_block_size = old_size; //store the value for later
++    Memblock *old_block = block_from_payload(oldptr);
++    unsigned int old_size = get_size(old_block);
++    unsigned int coalesce_size = 0;
+ 
+-    if(adjustedsz <= old_size){
+-        if(adjustedsz*REALLOC_BUFFER+MIN_FRACTURE_SIZE < old_size) {
+-            oldblock = split_block(oldblock, get_index(old_size), adjust_size(newsz*REALLOC_BUFFER));
+-            oldblock = create_allocd_block(oldblock, adjust_size(newsz*REALLOC_BUFFER));
+-        }
++    if (adjustedsz <= old_size) return oldptr;
++
++    Memblock *next_block = next_contiguous(old_block);
++    if(next_block != wilderness && !is_allocd(next_block)) coalesce_size = get_size(next_block);
++
++    if(adjustedsz <= old_size + coalesce_size) {
++        remove_element(next_block, get_index(get_size(next_block))); //removes from the freed array 
++        old_block = create_allocd_block(old_block, old_size + coalesce_size);
++        next_contiguous(old_block)->header.prevsz = old_block->header.size;
+         return oldptr;
+     }
+-     
+-    Memblock *nextBlock = next_contiguous(oldblock);
+-    if(nextBlock != NULL && nextBlock != wilderness) old_size+=get_size(nextBlock);
+-    if(adjustedsz <= old_size){
+-        unsigned int merged_req = original_block_size + REALLOC_SPLIT_MIN; //minimum required combined size 
+-        if(merged_req < original_block_size + get_size(nextBlock) - MIN_FRACTURE_SIZE){
+-            remove_element(nextBlock, get_index(get_size(nextBlock))); //removes from the freed array 
+-            oldblock = create_allocd_block(oldblock, old_size);
+-            return oldptr;
+-        }
+-    }
+-/*
+-    Memblock *prevBlock = prev_contiguous(oldblock);
+-    if(prevBlock != NULL && adjustedsz <= oldSize+get_size(prevBlock)){
+-        remove_element(prevBlock, get_index(get_size(prevBlock)));
+-        prevBlock = create_allocd_block(prevBlock, oldSize+get_size(prevBlock));
+-        void *newptr = get_payload(prevBlock);
+-        memcpy(newptr, oldptr, (size_t)get_size(oldblock)-2*WSIZE);
+-        return newptr;     
+-    }
+-*/
+ 
+-    void *newptr = mymalloc(newsz*REALLOC_BUFFER);
+-    memcpy(newptr, oldptr, (size_t)get_size(oldblock)-2*WSIZE);
++    void *newptr = mymalloc(newsz * REALLOC_BUFFER);
++    memcpy(newptr, oldptr, (size_t)get_size(old_block) - sizeof(Header));
+     myfree(oldptr);
+     return newptr;
+ }
